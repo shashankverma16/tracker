@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=Nunito:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
   tailwind.config = {
     darkMode: 'media',
@@ -87,6 +88,7 @@ function loadStore() {
 function saveStore(store) {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); }
   catch(e) { console.error('save error', e); showToast('Could not save — storage full?'); }
+  scheduleAutoSync();
 }
 
 let store = loadStore(); // { "YYYY-MM-DD": [ {id, type, amount, time (HH:MM, 24h)} ] }
@@ -96,6 +98,229 @@ const NAME_KEY = 'milkTrackerMotherName_v1';
 function loadMotherName(){ try { return localStorage.getItem(NAME_KEY) || ''; } catch(e){ return ''; } }
 function saveMotherName(name){ try { localStorage.setItem(NAME_KEY, name); } catch(e){ console.error(e); } }
 let motherName = loadMotherName();
+
+/* ---------------- Theme ---------------- */
+const THEME_KEY = 'milkTrackerTheme_v1';
+function loadTheme(){ try { return localStorage.getItem(THEME_KEY) || 'system'; } catch(e){ return 'system'; } }
+function saveTheme(t){ try { localStorage.setItem(THEME_KEY, t); } catch(e){ console.error(e); } }
+function applyTheme(t){
+  if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+  else if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  else document.documentElement.removeAttribute('data-theme');
+}
+let currentTheme = loadTheme();
+applyTheme(currentTheme);
+
+/* ==================================================================
+   GOOGLE DRIVE SYNC
+   ------------------------------------------------------------------
+   SETUP REQUIRED — see README.md for the full walkthrough. In short:
+   1. Create a project in Google Cloud Console.
+   2. Enable the "Google Drive API".
+   3. Configure the OAuth consent screen (scope: drive.file).
+   4. Create an OAuth 2.0 Client ID (type: Web application) and add
+      your site's URL (e.g. https://yourname.github.io) — and
+      http://localhost:PORT for local testing — under
+      "Authorized JavaScript origins".
+   5. Paste that Client ID below.
+   ================================================================== */
+const GOOGLE_CLIENT_ID = '1049335047350-1gsju0s1ef8frihvec7tnvhl8uijbri8.apps.googleusercontent.com.apps.googleusercontent.com';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_FILE_NAME = 'milk-tracker-data.json';
+
+let driveTokenClient = null;
+let driveAccessToken = null;
+let driveTokenExpiresAt = 0;
+let driveFileId = localStorage.getItem('milkTrackerDriveFileId_v1') || null;
+let driveEmail = localStorage.getItem('milkTrackerDriveEmail_v1') || null;
+let autoSyncEnabled = localStorage.getItem('milkTrackerAutoSync_v1') === 'true';
+let lastSyncedAt = localStorage.getItem('milkTrackerLastSync_v1') || null;
+let syncStatus = 'idle'; // idle | syncing | success | error
+let syncStatusMsg = '';
+let driveConfigured = !GOOGLE_CLIENT_ID.startsWith('YOUR_GOOGLE_CLIENT_ID');
+
+// Poll for the Google Identity Services script (loaded async/defer) then init once.
+let gisPoll = setInterval(() => {
+  if (window.google && google.accounts && google.accounts.oauth2) {
+    clearInterval(gisPoll);
+    initGoogleDrive();
+  }
+}, 250);
+
+function initGoogleDrive(){
+  if (!driveConfigured) return; // no client id pasted in yet — sync UI will explain this
+  driveTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: DRIVE_SCOPE,
+    callback: (resp) => {
+      if (resp.error){
+        syncStatus = 'error';
+        syncStatusMsg = resp.error === 'access_denied' ? 'Access was declined' : 'Connection failed';
+        render();
+        return;
+      }
+      driveAccessToken = resp.access_token;
+      driveTokenExpiresAt = Date.now() + (Number(resp.expires_in || 3600) * 1000);
+      fetchDriveUserInfo();
+    }
+  });
+}
+
+function connectDrive(){
+  if (!driveConfigured){ showToast('Add your Google Client ID first — see README.md'); return; }
+  if (!driveTokenClient){ showToast('Still loading Google Sign-In — try again in a moment'); return; }
+  driveTokenClient.requestAccessToken({ prompt: 'consent' });
+}
+
+function disconnectDrive(){
+  if (driveAccessToken && window.google && google.accounts && google.accounts.oauth2){
+    google.accounts.oauth2.revoke(driveAccessToken, () => {});
+  }
+  driveAccessToken = null;
+  driveTokenExpiresAt = 0;
+  driveEmail = null;
+  localStorage.removeItem('milkTrackerDriveEmail_v1');
+  syncStatus = 'idle'; syncStatusMsg = '';
+  showToast('Disconnected from Google Drive');
+  render();
+}
+
+async function fetchDriveUserInfo(){
+  try {
+    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: 'Bearer ' + driveAccessToken }
+    });
+    const data = await res.json();
+    driveEmail = data.email || 'Connected';
+  } catch(e){
+    driveEmail = 'Connected';
+  }
+  localStorage.setItem('milkTrackerDriveEmail_v1', driveEmail);
+  showToast('Connected to Google Drive');
+  render();
+  if (autoSyncEnabled) syncToDrive();
+}
+
+// Ensures we have a live access token, trying a silent (no-UI) refresh first.
+function ensureDriveToken(interactive){
+  if (driveAccessToken && Date.now() < driveTokenExpiresAt - 30000) return Promise.resolve(true);
+  if (!driveTokenClient) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    driveTokenClient.callback = (resp) => {
+      if (resp.error){ resolve(false); return; }
+      driveAccessToken = resp.access_token;
+      driveTokenExpiresAt = Date.now() + (Number(resp.expires_in || 3600) * 1000);
+      resolve(true);
+    };
+    driveTokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+  });
+}
+
+async function findDriveFile(){
+  const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}' and trashed=false`);
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&spaces=drive`, {
+    headers: { Authorization: 'Bearer ' + driveAccessToken }
+  });
+  if (!res.ok) throw new Error('drive_list_failed');
+  const data = await res.json();
+  return (data.files && data.files[0]) || null;
+}
+
+async function syncToDrive(){
+  if (!driveConfigured) return;
+  const ok = await ensureDriveToken(false);
+  if (!ok){ syncStatus = 'error'; syncStatusMsg = 'Reconnect Google Drive to sync'; render(); return; }
+
+  syncStatus = 'syncing'; syncStatusMsg = ''; render();
+  try {
+    const payload = JSON.stringify({ store, motherName, exportedAt: new Date().toISOString() }, null, 2);
+    let fileId = driveFileId;
+    if (!fileId){
+      const existing = await findDriveFile();
+      if (existing) fileId = existing.id;
+    }
+
+    if (fileId){
+      const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+        method: 'PATCH',
+        headers: { Authorization: 'Bearer ' + driveAccessToken, 'Content-Type': 'application/json' },
+        body: payload
+      });
+      if (!res.ok) throw new Error('upload_failed');
+    } else {
+      const boundary = 'milktracker' + Date.now();
+      const metadata = { name: DRIVE_FILE_NAME, mimeType: 'application/json' };
+      const body =
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+        `--${boundary}\r\nContent-Type: application/json\r\n\r\n${payload}\r\n--${boundary}--`;
+      const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + driveAccessToken, 'Content-Type': `multipart/related; boundary=${boundary}` },
+        body
+      });
+      if (!res.ok) throw new Error('create_failed');
+      const created = await res.json();
+      fileId = created.id;
+    }
+
+    driveFileId = fileId;
+    localStorage.setItem('milkTrackerDriveFileId_v1', fileId);
+    lastSyncedAt = new Date().toISOString();
+    localStorage.setItem('milkTrackerLastSync_v1', lastSyncedAt);
+    syncStatus = 'success'; syncStatusMsg = 'Synced';
+    render();
+  } catch(e){
+    console.error(e);
+    syncStatus = 'error'; syncStatusMsg = 'Sync failed — try again';
+    render();
+  }
+}
+
+async function restoreFromDrive(){
+  if (!driveConfigured){ showToast('Add your Google Client ID first — see README.md'); return; }
+  const ok = await ensureDriveToken(false);
+  if (!ok){ showToast('Connect Google Drive first'); return; }
+
+  try {
+    let fileId = driveFileId;
+    if (!fileId){
+      const existing = await findDriveFile();
+      if (!existing){ showToast('No backup found on Drive yet'); return; }
+      fileId = existing.id;
+      driveFileId = fileId;
+      localStorage.setItem('milkTrackerDriveFileId_v1', fileId);
+    }
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+      headers: { Authorization: 'Bearer ' + driveAccessToken }
+    });
+    if (!res.ok) throw new Error('download_failed');
+    const data = await res.json();
+
+    if (!confirm('This replaces all data on this device with your Google Drive backup. Continue?')) return;
+    store = data.store || {};
+    saveStore(store);
+    if (data.motherName){ motherName = data.motherName; saveMotherName(motherName); }
+    showToast('Restored from Google Drive');
+    render();
+  } catch(e){
+    console.error(e);
+    showToast('Restore failed — try again');
+  }
+}
+
+function toggleAutoSync(){
+  autoSyncEnabled = !autoSyncEnabled;
+  localStorage.setItem('milkTrackerAutoSync_v1', String(autoSyncEnabled));
+  if (autoSyncEnabled) syncToDrive();
+  render();
+}
+
+let autoSyncTimer = null;
+function scheduleAutoSync(){
+  if (typeof autoSyncEnabled === 'undefined' || !autoSyncEnabled || !driveAccessToken) return;
+  clearTimeout(autoSyncTimer);
+  autoSyncTimer = setTimeout(() => syncToDrive(), 2500);
+}
 
 /* ---------------- Motivational messages ---------------- */
 const MOTIVATIONS = [
@@ -245,6 +470,11 @@ function render(){
     attachOnboardingHandlers();
     return;
   }
+  if (view === 'sync'){
+    app.innerHTML = renderSync();
+    attachSyncHandlers();
+    return;
+  }
   app.innerHTML = view === 'home' ? renderHome() : renderArchive();
   attachHomeOrArchiveHandlers();
   if (modal) renderModal();
@@ -284,10 +514,97 @@ function attachOnboardingHandlers(){
   input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); });
 }
 
+function renderSync(){
+  const connected = !!driveEmail;
+  const statusDot = { idle:'#9CA3AF', syncing:'#F0A868', success:'#8FD3A6', error:'#E88AA3' }[syncStatus] || '#9CA3AF';
+  const statusLabel = { idle:'', syncing:'Syncing…', success:'Synced', error: syncStatusMsg || 'Error' }[syncStatus] || '';
+
+  return `
+    <header class="pt-8 pb-4 flex items-center gap-3">
+      <button id="syncBackBtn" class="w-9 h-9 rounded-full flex items-center justify-center card">←</button>
+      <h1 class="font-display text-2xl font-bold">Google Drive Sync</h1>
+    </header>
+
+    ${!driveConfigured ? `
+      <div class="card rounded-2xl p-4 mb-4" style="border-color:#F0A86855">
+        <p class="text-sm font-semibold mb-1">⚠️ Setup needed</p>
+        <p class="text-xs text-[var(--ink-soft)] leading-relaxed">Drive sync needs a free Google OAuth Client ID pasted into the code before it can connect. See <span class="font-semibold">README.md</span> in the project for step-by-step instructions.</p>
+      </div>
+    ` : ''}
+
+    <section class="card rounded-3xl p-5">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="w-11 h-11 rounded-full flex items-center justify-center text-xl flex-shrink-0" style="background:var(--pink)22">☁️</div>
+        <div class="flex-1 min-w-0">
+          <p class="font-semibold text-sm">${connected ? 'Connected' : 'Not connected'}</p>
+          <p class="text-xs text-[var(--ink-soft)] truncate">${connected ? driveEmail : 'Connect your Google account to back up feeds'}</p>
+        </div>
+      </div>
+      <button id="driveConnectBtn" class="w-full font-display font-bold text-sm py-3 rounded-xl transition active:scale-[0.98] ${connected ? 'border-2 border-[var(--cream-border)] text-[var(--ink-soft)]' : 'text-white'}" style="${connected ? '' : 'background:var(--pink)'}">
+        ${connected ? 'Disconnect' : 'Connect Google Drive'}
+      </button>
+    </section>
+
+    <section class="card rounded-3xl p-5 mt-4">
+      <div class="flex items-center justify-between mb-1">
+        <div>
+          <p class="font-semibold text-sm">Auto-sync</p>
+          <p class="text-xs text-[var(--ink-soft)]">Pushes changes to Drive a couple seconds after each edit</p>
+        </div>
+        <button id="autoSyncToggle" class="w-12 h-7 rounded-full flex-shrink-0 flex items-center px-0.5 transition" style="background:${autoSyncEnabled ? 'var(--pink)' : 'var(--cream-border)'}">
+          <span class="w-6 h-6 bg-white rounded-full shadow transition-transform ${autoSyncEnabled ? 'translate-x-5' : ''}"></span>
+        </button>
+      </div>
+    </section>
+
+    <section class="mt-4 space-y-2">
+      <button id="syncNowBtn" class="w-full bg-[var(--pink)] hover:bg-[var(--pink-deep)] active:scale-[0.98] transition text-white font-display font-bold text-sm py-3 rounded-xl">
+        ⬆ Sync Now
+      </button>
+      <button id="restoreBtn" class="w-full border-2 border-[var(--cream-border)] text-[var(--ink-soft)] font-display font-bold text-sm py-3 rounded-xl transition active:scale-[0.98]">
+        ⬇ Restore from Drive
+      </button>
+    </section>
+
+    <div class="mt-4 text-center">
+      ${statusLabel ? `
+        <p class="text-xs font-semibold inline-flex items-center gap-1.5" style="color:${syncStatus==='error' ? '#D97E32' : 'var(--ink-soft)'}">
+          <span class="w-2 h-2 rounded-full" style="background:${statusDot}"></span>${statusLabel}
+        </p>
+      ` : ''}
+      ${lastSyncedAt ? `<p class="text-[11px] text-[var(--ink-soft)] mt-1">Last synced ${new Date(lastSyncedAt).toLocaleString()}</p>` : ''}
+    </div>
+  `;
+}
+
+function attachSyncHandlers(){
+  document.getElementById('syncBackBtn').addEventListener('click', () => { view = 'home'; render(); });
+  document.getElementById('driveConnectBtn').addEventListener('click', () => {
+    if (driveEmail) disconnectDrive(); else connectDrive();
+  });
+  document.getElementById('autoSyncToggle').addEventListener('click', toggleAutoSync);
+  document.getElementById('syncNowBtn').addEventListener('click', syncToDrive);
+  document.getElementById('restoreBtn').addEventListener('click', restoreFromDrive);
+}
+
 function progressColor(total){
   if (total < TARGET_MIN) return { bar: '#9ECBEB', liquid: '#AEDFF7', text: 'var(--ink-soft)' };
   if (total <= TARGET_MAX) return { bar: '#8FD3A6', liquid: '#B9E8C6', text: '#4E9C6B' };
   return { bar: '#F0A868', liquid: '#F7C08C', text: '#D97E32' };
+}
+
+function themeToggleHTML(){
+  const opts = [ ['light','☀️'], ['dark','🌙'], ['system','🖥️'] ];
+  return `
+    <div class="flex items-center gap-0.5 card rounded-full p-1 flex-shrink-0">
+      ${opts.map(([key,icon]) => `
+        <button data-theme-btn="${key}" title="${key[0].toUpperCase()+key.slice(1)} mode"
+          class="w-8 h-8 rounded-full flex items-center justify-center text-sm transition ${currentTheme===key ? 'bg-[var(--pink)]' : ''}">
+          ${icon}
+        </button>
+      `).join('')}
+    </div>
+  `;
 }
 
 function renderHome(){
@@ -311,7 +628,15 @@ function renderHome(){
         <h1 class="font-display text-2xl font-bold mt-0.5">Hi ${escapeHtml(motherName)} 💙</h1>
         <p class="text-xs text-[var(--ink-soft)] font-medium mt-1 max-w-[230px] leading-snug">${getMotivationForToday()}</p>
       </div>
-      <button id="renameBtn" class="text-2xl flex-shrink-0 leading-none" title="Edit name">🍼</button>
+      <div class="flex flex-col items-end gap-2 flex-shrink-0">
+        ${themeToggleHTML()}
+        <div class="flex items-center gap-2">
+          <button id="syncOpenBtn" class="w-8 h-8 rounded-full flex items-center justify-center text-base card relative" title="Google Drive sync">
+            ☁️${autoSyncEnabled && driveEmail ? '<span class="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full" style="background:#8FD3A6"></span>' : ''}
+          </button>
+          <button id="renameBtn" class="text-xl leading-none" title="Edit name">🍼</button>
+        </div>
+      </div>
     </header>
 
     <section class="card rounded-3xl p-6 shadow-sm">
@@ -468,9 +793,12 @@ function animateBottle(){
 function renderArchive(){
   const keys = Object.keys(store).filter(k => k !== todayKey() && (store[k]||[]).length > 0).sort((a,b)=> b.localeCompare(a));
   return `
-    <header class="pt-8 pb-4 flex items-center gap-3">
-      <button id="backBtn" class="w-9 h-9 rounded-full flex items-center justify-center card">←</button>
-      <h1 class="font-display text-2xl font-bold">Archive</h1>
+    <header class="pt-8 pb-4 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <button id="backBtn" class="w-9 h-9 rounded-full flex items-center justify-center card">←</button>
+        <h1 class="font-display text-2xl font-bold">Archive</h1>
+      </div>
+      ${themeToggleHTML()}
     </header>
 
     ${keys.length === 0 ? `
@@ -680,6 +1008,18 @@ function attachHomeOrArchiveHandlers(){
 
   const renameBtn = document.getElementById('renameBtn');
   if (renameBtn) renameBtn.addEventListener('click', () => { modal = { mode:'rename' }; renderModal(); });
+
+  const syncOpenBtn = document.getElementById('syncOpenBtn');
+  if (syncOpenBtn) syncOpenBtn.addEventListener('click', () => { view = 'sync'; render(); });
+
+  document.querySelectorAll('[data-theme-btn]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      currentTheme = btn.dataset.themeBtn;
+      saveTheme(currentTheme);
+      applyTheme(currentTheme);
+      render();
+    });
+  });
 
   const archiveBtn = document.getElementById('archiveBtn');
   if (archiveBtn) archiveBtn.addEventListener('click', () => { view = 'archive'; render(); });
